@@ -6,15 +6,20 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"sync/atomic"
 
 	"github.com/matsuridayo/libneko/neko_common"
 	"github.com/matsuridayo/libneko/syscallw"
 )
 
 var LogWriter *logWriter
-var LogWriterDisable = false
+var logWriterDisabled atomic.Bool
 var TruncateOnStart = true
 var NB4AGuiLogWriter io.Writer
+
+func SetLogEnabled(enabled bool) {
+	logWriterDisabled.Store(!enabled)
+}
 
 func SetupLog(maxSize int, path string) (err error) {
 	if LogWriter != nil {
@@ -80,7 +85,7 @@ type logWriter struct {
 }
 
 func (w *logWriter) Write(p []byte) (int, error) {
-	if LogWriterDisable {
+	if logWriterDisabled.Load() {
 		return len(p), nil
 	}
 

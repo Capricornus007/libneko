@@ -2,7 +2,6 @@ package speedtest
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -13,90 +12,131 @@ import (
 
 const UrlTestStandard_RTT = 0
 const UrlTestStandard_Handshake = 1
-const UrlTestStandard_FisrtHandshake = 2
+const UrlTestStandard_FirstHandshake = 2
 
-var errNoRedir = errors.New("no redir")
+// UrlTestStandard_FisrtHandshake is kept for source compatibility.
+const UrlTestStandard_FisrtHandshake = UrlTestStandard_FirstHandshake
 
-func UrlTest(client *http.Client, link string, timeout int32, standard int) (int32, error) {
-	if client == nil {
-		return 0, fmt.Errorf("no client")
-	}
-	defer client.CloseIdleConnections()
-
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		return errNoRedir
-	}
-
-	var time_start time.Time
-	var hsk_end time.Time
-	var time_end time.Time
-	var times int
-
-	switch standard {
-	case UrlTestStandard_FisrtHandshake:
-		times = 1
-	case UrlTestStandard_Handshake:
-		times = 2
-		rt := client.Transport.(*http.Transport)
-		rt.DisableKeepAlives = true
-	case UrlTestStandard_RTT:
-		times = 2
-	default:
-		return 0, errors.New("unknown urltest standard")
-	}
-	baseCtx := context.WithValue(context.Background(), "nb4a_no_concurrent_dial", true)
-	ctx, cancel := context.WithTimeout(baseCtx, time.Duration(timeout)*time.Millisecond)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", link, nil)
+func URLTest(ctx context.Context, client *http.Client, link string) (int32, error) {
+	probeClient, err := prepareURLTestClient(client, false)
 	if err != nil {
 		return 0, err
 	}
+	defer probeClient.CloseIdleConnections()
 
-	trace := &httptrace.ClientTrace{
-		TLSHandshakeDone: func(cs tls.ConnectionState, err error) {
-			hsk_end = time.Now()
-		},
-		GotFirstResponseByte: func() {
-			time_end = time.Now()
-		},
-		WroteHeaders: func() {
-			hsk_end = time.Now()
-		},
+	start := time.Now()
+	wroteHeaders, firstByte, err := performURLTestRequest(ctx, probeClient, link)
+	if err != nil {
+		return 0, err
 	}
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
-
-	for i := 0; i < times; i++ {
-		time_start = time.Now()
-		resp, err := client.Do(req)
-		if err != nil {
-			if errors.Is(err, errNoRedir) {
-				err = nil
-			} else {
-				return 0, err
-			}
-		}
-		resp.Body.Close()
-	}
-
-	if time_end.IsZero() {
-		time_end = time.Now()
-	}
-
-	if standard == UrlTestStandard_RTT {
-		time_start = hsk_end
-	}
-
-	return int32(time_end.Sub(time_start).Milliseconds()), nil
+	return durationMilliseconds(responseRTT(time.Since(start), wroteHeaders, firstByte)), nil
 }
 
-func TcpPing(address string, timeout int32) (ms int32, err error) {
-	startTime := time.Now()
-	c, err := net.DialTimeout("tcp", address, time.Duration(timeout)*time.Millisecond)
-	endTime := time.Now()
-	if err == nil {
-		ms = int32(endTime.Sub(startTime).Milliseconds())
-		c.Close()
+func UrlTest(ctx context.Context, client *http.Client, link string, standard int) (int32, error) {
+	disableKeepAlives := standard == UrlTestStandard_Handshake
+	probeClient, err := prepareURLTestClient(client, disableKeepAlives)
+	if err != nil {
+		return 0, err
 	}
-	return
+	defer probeClient.CloseIdleConnections()
+
+	attempts := 2
+	switch standard {
+	case UrlTestStandard_FirstHandshake:
+		attempts = 1
+	case UrlTestStandard_Handshake:
+	case UrlTestStandard_RTT:
+	default:
+		return 0, errors.New("unknown urltest standard")
+	}
+
+	var elapsed time.Duration
+	for range attempts {
+		start := time.Now()
+		wroteHeaders, firstByte, requestErr := performURLTestRequest(ctx, probeClient, link)
+		if requestErr != nil {
+			return 0, requestErr
+		}
+		elapsed = time.Since(start)
+		if standard == UrlTestStandard_RTT {
+			elapsed = responseRTT(elapsed, wroteHeaders, firstByte)
+		}
+	}
+
+	return durationMilliseconds(elapsed), nil
+}
+
+func prepareURLTestClient(client *http.Client, disableKeepAlives bool) (*http.Client, error) {
+	if client == nil {
+		return nil, errors.New("no client")
+	}
+	probeClient := *client
+	probeClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	if transport, ok := client.Transport.(*http.Transport); ok {
+		probeTransport := transport.Clone()
+		probeTransport.DisableKeepAlives = disableKeepAlives
+		probeClient.Transport = probeTransport
+	} else if disableKeepAlives {
+		return nil, fmt.Errorf("URLTest handshake mode requires *http.Transport, got %T", client.Transport)
+	}
+	return &probeClient, nil
+}
+
+func performURLTestRequest(ctx context.Context, client *http.Client, link string) (time.Time, time.Time, error) {
+	var wroteHeaders time.Time
+	var firstByte time.Time
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, link, nil)
+	if err != nil {
+		return wroteHeaders, firstByte, err
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		WroteHeaders: func() {
+			wroteHeaders = time.Now()
+		},
+		GotFirstResponseByte: func() {
+			firstByte = time.Now()
+		},
+	}))
+	resp, err := client.Do(req)
+	if err != nil {
+		return wroteHeaders, firstByte, err
+	}
+	if resp.Body != nil {
+		err = resp.Body.Close()
+	}
+	return wroteHeaders, firstByte, err
+}
+
+func responseRTT(fallback time.Duration, wroteHeaders, firstByte time.Time) time.Duration {
+	if wroteHeaders.IsZero() || firstByte.IsZero() || firstByte.Before(wroteHeaders) {
+		return fallback
+	}
+	return firstByte.Sub(wroteHeaders)
+}
+
+func TCPPing(
+	ctx context.Context,
+	dialContext func(context.Context, string, string) (net.Conn, error),
+	address string,
+) (int32, error) {
+	if dialContext == nil {
+		return 0, errors.New("no dialer")
+	}
+	start := time.Now()
+	conn, err := dialContext(ctx, "tcp", address)
+	if err != nil {
+		return 0, err
+	}
+	elapsed := time.Since(start)
+	if closeErr := conn.Close(); closeErr != nil {
+		return 0, closeErr
+	}
+	return durationMilliseconds(elapsed), nil
+}
+
+func durationMilliseconds(duration time.Duration) int32 {
+	milliseconds := max(duration.Milliseconds(), 0)
+	return int32(min(milliseconds, int64(^uint32(0)>>1)))
 }
